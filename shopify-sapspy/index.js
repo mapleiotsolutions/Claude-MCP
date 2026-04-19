@@ -326,6 +326,118 @@ async function getUnpaidOrders({ limit = 50 }) {
   return searchOrders({ query: "financial_status:unpaid", limit });
 }
 
+async function resolveOrder(identifier) {
+  // Fetch id, pre-state, currency, and canMarkAsPaid from either a GID or a name (e.g. "#3114").
+  const selection = `
+    id name
+    displayFinancialStatus
+    canMarkAsPaid
+    totalPriceSet { shopMoney { amount currencyCode } }
+    totalOutstandingSet { shopMoney { amount currencyCode } }
+  `;
+  if (identifier.startsWith("gid://")) {
+    const q = `query($id: ID!) { order(id: $id) { ${selection} } }`;
+    const data = await gql(q, { id: identifier });
+    return data.order;
+  }
+  const name = identifier.startsWith("#") ? identifier : `#${identifier}`;
+  const q = `
+    query($query: String) {
+      orders(first: 1, query: $query) { edges { node { ${selection} } } }
+    }
+  `;
+  const data = await gql(q, { query: `name:${name}` });
+  return data.orders.edges[0]?.node || null;
+}
+
+function summarizeOrderState(o) {
+  return {
+    financialStatus: o.displayFinancialStatus,
+    outstanding: o.totalOutstandingSet
+      ? {
+          amount: o.totalOutstandingSet.shopMoney?.amount,
+          currency: o.totalOutstandingSet.shopMoney?.currencyCode,
+        }
+      : undefined,
+  };
+}
+
+async function recordOrderPayment({ orderId, amount, paymentMethodName }) {
+  if (!orderId) throw new Error("orderId is required");
+
+  const pre = await resolveOrder(orderId);
+  if (!pre) return { error: `Order not found: ${orderId}` };
+  if (!pre.canMarkAsPaid) {
+    return {
+      error: `Order ${pre.name} cannot be marked as paid (current status: ${pre.displayFinancialStatus}, outstanding: ${pre.totalOutstandingSet?.shopMoney?.amount} ${pre.totalOutstandingSet?.shopMoney?.currencyCode}). If it is already PAID or has zero outstanding balance, no action is needed.`,
+      order: { id: pre.id, name: pre.name, ...summarizeOrderState(pre) },
+    };
+  }
+
+  const before = summarizeOrderState(pre);
+
+  if (amount == null) {
+    // Full outstanding — orderMarkAsPaid works on all Shopify plans.
+    const mutation = `
+      mutation($input: OrderMarkAsPaidInput!) {
+        orderMarkAsPaid(input: $input) {
+          order {
+            id name
+            displayFinancialStatus
+            totalOutstandingSet { shopMoney { amount currencyCode } }
+          }
+          userErrors { field message }
+        }
+      }
+    `;
+    const data = await gql(mutation, { input: { id: pre.id } });
+    const res = data.orderMarkAsPaid;
+    if (res.userErrors?.length) {
+      return { error: res.userErrors.map((e) => e.message).join("; "), userErrors: res.userErrors };
+    }
+    return {
+      order: { id: res.order.id, name: res.order.name },
+      mutation: "orderMarkAsPaid",
+      appliedAmount: before.outstanding,
+      before,
+      after: summarizeOrderState(res.order),
+    };
+  }
+
+  // Partial or specific amount — orderCreateManualPayment (Shopify Plus required for amount field).
+  const currency = pre.totalOutstandingSet?.shopMoney?.currencyCode;
+  if (!currency) return { error: "Could not determine order currency." };
+
+  const mutation = `
+    mutation($id: ID!, $amount: MoneyInput, $paymentMethodName: String) {
+      orderCreateManualPayment(id: $id, amount: $amount, paymentMethodName: $paymentMethodName) {
+        order {
+          id name
+          displayFinancialStatus
+          totalOutstandingSet { shopMoney { amount currencyCode } }
+        }
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await gql(mutation, {
+    id: pre.id,
+    amount: { amount: String(amount), currencyCode: currency },
+    paymentMethodName: paymentMethodName || null,
+  });
+  const res = data.orderCreateManualPayment;
+  if (res.userErrors?.length) {
+    return { error: res.userErrors.map((e) => e.message).join("; "), userErrors: res.userErrors };
+  }
+  return {
+    order: { id: res.order.id, name: res.order.name },
+    mutation: "orderCreateManualPayment",
+    appliedAmount: { amount: String(amount), currency },
+    before,
+    after: summarizeOrderState(res.order),
+  };
+}
+
 async function getInventoryForSku({ sku }) {
   const q = `
     query($query: String) {
@@ -445,6 +557,32 @@ const TOOLS = [
     },
   },
   {
+    name: "record_order_payment",
+    description:
+      "Record a manual payment on a single order (cash, check, bank transfer, etc.). REQUIRES write_orders scope. Operates on one order at a time — no bulk. If `amount` is omitted, marks the full outstanding balance paid via orderMarkAsPaid (works on all Shopify plans). If `amount` is provided, records a partial payment via orderCreateManualPayment (REQUIRES Shopify Plus). Returns before/after financial status and outstanding balance so the caller can verify the effect.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        orderId: {
+          type: "string",
+          description:
+            "Order GID (e.g. 'gid://shopify/Order/123...') or order name (e.g. '#3114'). Required.",
+        },
+        amount: {
+          type: "number",
+          description:
+            "Optional. The payment amount in the order's currency. Omit to pay the full outstanding balance. Partial amounts require Shopify Plus.",
+        },
+        paymentMethodName: {
+          type: "string",
+          description:
+            "Optional label for the payment method (e.g. 'Cash', 'Check'). Defaults to 'Other'. Only used when `amount` is provided.",
+        },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
     name: "get_inventory_for_sku",
     description:
       "Look up current inventory and price for a specific SKU. Returns variant-level details.",
@@ -482,6 +620,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "get_unpaid_orders":
         result = await getUnpaidOrders(args || {});
+        break;
+      case "record_order_payment":
+        result = await recordOrderPayment(args || {});
         break;
       case "get_inventory_for_sku":
         result = await getInventoryForSku(args);
