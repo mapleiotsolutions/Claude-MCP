@@ -464,6 +464,213 @@ async function getInventoryForSku({ sku }) {
   }));
 }
 
+function compactCustomer(c) {
+  const numericId = c.id?.replace("gid://shopify/Customer/", "");
+  return {
+    id: c.id,
+    name: c.displayName,
+    firstName: c.firstName,
+    lastName: c.lastName,
+    email: c.email,
+    phone: c.phone,
+    emailMarketing: c.emailMarketingConsent
+      ? {
+          state: c.emailMarketingConsent.marketingState,
+          optInLevel: c.emailMarketingConsent.marketingOptInLevel,
+          consentUpdatedAt: c.emailMarketingConsent.consentUpdatedAt,
+        }
+      : null,
+    tags: c.tags,
+    createdAt: c.createdAt,
+    updatedAt: c.updatedAt,
+    url: numericId
+      ? `https://${STORE}.myshopify.com/admin/customers/${numericId}`
+      : undefined,
+  };
+}
+
+async function listCustomers({ query = "", limit = 50, subscribed } = {}) {
+  // Convenience: if `subscribed` is explicitly true/false, translate to Shopify
+  // search syntax using email_marketing_state. Merge with any user-supplied query.
+  let effectiveQuery = query || "";
+  if (subscribed === true) {
+    effectiveQuery = [effectiveQuery, "email_marketing_state:SUBSCRIBED"]
+      .filter(Boolean)
+      .join(" ");
+  } else if (subscribed === false) {
+    effectiveQuery = [effectiveQuery, "email_marketing_state:UNSUBSCRIBED"]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  const q = `
+    query($query: String, $first: Int!) {
+      customers(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) {
+        edges {
+          node {
+            id displayName firstName lastName email phone tags createdAt updatedAt
+            emailMarketingConsent {
+              marketingState marketingOptInLevel consentUpdatedAt
+            }
+          }
+        }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  `;
+  const data = await gql(q, {
+    query: effectiveQuery,
+    first: Math.min(limit, 250),
+  });
+  return {
+    customers: data.customers.edges.map((e) => compactCustomer(e.node)),
+    hasNextPage: data.customers.pageInfo.hasNextPage,
+    endCursor: data.customers.pageInfo.endCursor,
+  };
+}
+
+async function resolveCustomer(identifier) {
+  const selection = `
+    id displayName firstName lastName email phone tags note verifiedEmail
+    createdAt updatedAt
+    emailMarketingConsent {
+      marketingState marketingOptInLevel consentUpdatedAt
+      sourceLocation { id name }
+    }
+    defaultAddress { formattedArea }
+  `;
+
+  if (identifier.startsWith("gid://")) {
+    const q = `query($id: ID!) { customer(id: $id) { ${selection} } }`;
+    const data = await gql(q, { id: identifier });
+    return data.customer;
+  }
+  if (/^\d+$/.test(identifier)) {
+    const gid = `gid://shopify/Customer/${identifier}`;
+    const q = `query($id: ID!) { customer(id: $id) { ${selection} } }`;
+    const data = await gql(q, { id: gid });
+    return data.customer;
+  }
+  // Treat as email or phone via customerByIdentifier.
+  const identifierInput = identifier.includes("@")
+    ? { emailAddress: identifier }
+    : { phoneNumber: identifier };
+  const q = `
+    query($identifier: CustomerIdentifierInput!) {
+      customerByIdentifier(identifier: $identifier) { ${selection} }
+    }
+  `;
+  const data = await gql(q, { identifier: identifierInput });
+  return data.customerByIdentifier;
+}
+
+async function getCustomer({ identifier }) {
+  if (!identifier) throw new Error("identifier is required");
+  const c = await resolveCustomer(identifier);
+  if (!c) return null;
+  return {
+    ...compactCustomer(c),
+    note: c.note,
+    verifiedEmail: c.verifiedEmail,
+    defaultAddress: c.defaultAddress?.formattedArea,
+    emailMarketingSourceLocation: c.emailMarketingConsent?.sourceLocation || null,
+  };
+}
+
+const VALID_MARKETING_STATES = new Set(["SUBSCRIBED", "UNSUBSCRIBED", "PENDING"]);
+const VALID_OPT_IN_LEVELS = new Set([
+  "SINGLE_OPT_IN",
+  "CONFIRMED_OPT_IN",
+  "UNKNOWN",
+]);
+
+async function updateCustomerEmailMarketingConsent({
+  customerId,
+  marketingState,
+  marketingOptInLevel,
+  consentUpdatedAt,
+}) {
+  if (!customerId) throw new Error("customerId is required");
+  if (!marketingState) throw new Error("marketingState is required");
+
+  const state = String(marketingState).toUpperCase();
+  if (!VALID_MARKETING_STATES.has(state)) {
+    return {
+      error: `Invalid marketingState '${marketingState}'. Must be one of: SUBSCRIBED, UNSUBSCRIBED, PENDING. (NOT_SUBSCRIBED, REDACTED, and INVALID are read-only and cannot be set via this mutation.)`,
+    };
+  }
+
+  let optInLevel;
+  if (marketingOptInLevel != null) {
+    optInLevel = String(marketingOptInLevel).toUpperCase();
+    if (!VALID_OPT_IN_LEVELS.has(optInLevel)) {
+      return {
+        error: `Invalid marketingOptInLevel '${marketingOptInLevel}'. Must be one of: SINGLE_OPT_IN, CONFIRMED_OPT_IN, UNKNOWN.`,
+      };
+    }
+  }
+
+  const gid = customerId.startsWith("gid://")
+    ? customerId
+    : `gid://shopify/Customer/${customerId}`;
+
+  const pre = await resolveCustomer(gid);
+  if (!pre) return { error: `Customer not found: ${customerId}` };
+  if (!pre.email) {
+    return {
+      error: `Customer ${pre.displayName || pre.id} has no email address. Shopify requires an email on the customer record before their email marketing consent can be updated.`,
+    };
+  }
+
+  const before = {
+    state: pre.emailMarketingConsent?.marketingState,
+    optInLevel: pre.emailMarketingConsent?.marketingOptInLevel,
+    consentUpdatedAt: pre.emailMarketingConsent?.consentUpdatedAt,
+  };
+
+  const emailMarketingConsent = { marketingState: state };
+  if (optInLevel) emailMarketingConsent.marketingOptInLevel = optInLevel;
+  if (consentUpdatedAt) emailMarketingConsent.consentUpdatedAt = consentUpdatedAt;
+
+  const mutation = `
+    mutation($input: CustomerEmailMarketingConsentUpdateInput!) {
+      customerEmailMarketingConsentUpdate(input: $input) {
+        customer {
+          id email displayName
+          emailMarketingConsent {
+            marketingState marketingOptInLevel consentUpdatedAt
+          }
+        }
+        userErrors { field message code }
+      }
+    }
+  `;
+  const data = await gql(mutation, {
+    input: { customerId: gid, emailMarketingConsent },
+  });
+  const res = data.customerEmailMarketingConsentUpdate;
+  if (res.userErrors?.length) {
+    return {
+      error: res.userErrors.map((e) => e.message).join("; "),
+      userErrors: res.userErrors,
+      before,
+    };
+  }
+  return {
+    customer: {
+      id: res.customer.id,
+      name: res.customer.displayName,
+      email: res.customer.email,
+    },
+    before,
+    after: {
+      state: res.customer.emailMarketingConsent?.marketingState,
+      optInLevel: res.customer.emailMarketingConsent?.marketingOptInLevel,
+      consentUpdatedAt: res.customer.emailMarketingConsent?.consentUpdatedAt,
+    },
+  };
+}
+
 // ------------------------- MCP server wiring -------------------------
 
 const server = new Server(
@@ -594,6 +801,79 @@ const TOOLS = [
       required: ["sku"],
     },
   },
+  {
+    name: "list_customers",
+    description:
+      "List customers, optionally filtered by email marketing subscription state or a Shopify customer search query. Use the `subscribed` flag for the common case of finding who is/isn't opted in to email marketing, or pass `query` for full Shopify search syntax (e.g. 'email_marketing_state:PENDING', 'tag:wholesale', 'country:CA', 'updated_at:>2026-01-01'). Returns compact customer summaries (newest-updated first) with each customer's email marketing state, opt-in level, and last-updated timestamp. REQUIRES read_customers scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Optional Shopify customer search query. Empty string returns all customers.",
+        },
+        subscribed: {
+          type: "boolean",
+          description:
+            "Optional shortcut. true → only customers with email_marketing_state=SUBSCRIBED; false → only UNSUBSCRIBED. Omit to return all states. Merged with `query` if both are provided.",
+        },
+        limit: {
+          type: "number",
+          description: "Max results (default 50, cap 250).",
+        },
+      },
+    },
+  },
+  {
+    name: "get_customer",
+    description:
+      "Get full details for one customer, including email marketing consent state, opt-in level, consent source location, tags, verified email flag, and default address. Identifier can be a customer GID, numeric customer ID, email address, or phone number. REQUIRES read_customers scope.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        identifier: {
+          type: "string",
+          description:
+            "Customer GID, numeric ID, email address (contains '@'), or phone number (E.164 format, e.g. '+13125551212').",
+        },
+      },
+      required: ["identifier"],
+    },
+  },
+  {
+    name: "update_customer_email_marketing_consent",
+    description:
+      "Update a customer's email marketing subscription status in Shopify via the customerEmailMarketingConsentUpdate mutation. REQUIRES write_customers scope. The customer must already have an email address on their record. Only three states can be set: SUBSCRIBED (opted in), UNSUBSCRIBED (opted out), or PENDING (double opt-in waiting confirmation). NOT_SUBSCRIBED, REDACTED, and INVALID are read-only internal states and cannot be set. Returns before/after consent state so the caller can verify the change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        customerId: {
+          type: "string",
+          description:
+            "Customer GID (e.g. 'gid://shopify/Customer/123...') or numeric customer ID. Required.",
+        },
+        marketingState: {
+          type: "string",
+          enum: ["SUBSCRIBED", "UNSUBSCRIBED", "PENDING"],
+          description:
+            "Required. The email marketing state to set. SUBSCRIBED = opt in; UNSUBSCRIBED = opt out; PENDING = awaiting double opt-in confirmation.",
+        },
+        marketingOptInLevel: {
+          type: "string",
+          enum: ["SINGLE_OPT_IN", "CONFIRMED_OPT_IN", "UNKNOWN"],
+          description:
+            "Optional. The opt-in level at the time of consent (per M3AAWG guidelines).",
+        },
+        consentUpdatedAt: {
+          type: "string",
+          description:
+            "Optional. ISO 8601 datetime of when the customer gave or withdrew consent (e.g. '2026-04-23T14:30:00Z'). Defaults to the time the mutation runs if omitted.",
+        },
+      },
+      required: ["customerId", "marketingState"],
+    },
+  },
 ];
 
 server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: TOOLS }));
@@ -626,6 +906,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "get_inventory_for_sku":
         result = await getInventoryForSku(args);
+        break;
+      case "list_customers":
+        result = await listCustomers(args || {});
+        break;
+      case "get_customer":
+        result = await getCustomer(args);
+        break;
+      case "update_customer_email_marketing_consent":
+        result = await updateCustomerEmailMarketingConsent(args || {});
         break;
       default:
         throw new Error(`Unknown tool: ${name}`);
