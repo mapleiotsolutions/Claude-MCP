@@ -489,7 +489,7 @@ function compactCustomer(c) {
   };
 }
 
-async function listCustomers({ query = "", limit = 50, subscribed } = {}) {
+async function listCustomers({ query = "", limit = 50, subscribed, cursor } = {}) {
   // Convenience: if `subscribed` is explicitly true/false, translate to Shopify
   // search syntax using email_marketing_state. Merge with any user-supplied query.
   let effectiveQuery = query || "";
@@ -504,8 +504,8 @@ async function listCustomers({ query = "", limit = 50, subscribed } = {}) {
   }
 
   const q = `
-    query($query: String, $first: Int!) {
-      customers(first: $first, query: $query, sortKey: UPDATED_AT, reverse: true) {
+    query($query: String, $first: Int!, $after: String) {
+      customers(first: $first, query: $query, after: $after, sortKey: UPDATED_AT, reverse: true) {
         edges {
           node {
             id displayName firstName lastName email phone tags createdAt updatedAt
@@ -521,6 +521,7 @@ async function listCustomers({ query = "", limit = 50, subscribed } = {}) {
   const data = await gql(q, {
     query: effectiveQuery,
     first: Math.min(limit, 250),
+    after: cursor || null,
   });
   return {
     customers: data.customers.edges.map((e) => compactCustomer(e.node)),
@@ -821,6 +822,11 @@ const TOOLS = [
         limit: {
           type: "number",
           description: "Max results (default 50, cap 250).",
+        },
+        cursor: {
+          type: "string",
+          description:
+            "Optional pagination cursor. Pass the `endCursor` returned by a previous call to fetch the next page. Omit for the first page.",
         },
       },
     },
