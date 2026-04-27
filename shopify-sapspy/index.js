@@ -742,6 +742,139 @@ async function recordOrderPayment({ orderId, amount, paymentMethodName }) {
   };
 }
 
+function normalizeTagsInput(tags) {
+  if (Array.isArray(tags)) {
+    return tags.map((t) => String(t).trim()).filter(Boolean);
+  }
+  if (typeof tags === "string") {
+    return tags.split(",").map((t) => t.trim()).filter(Boolean);
+  }
+  return [];
+}
+
+async function resolveOrderIdAndTags(identifier) {
+  // Returns { id, name, tags } for any of GID / numeric ID / order name.
+  const selection = `id name tags`;
+  if (identifier.startsWith("gid://")) {
+    const q = `query($id: ID!) { order(id: $id) { ${selection} } }`;
+    const data = await gql(q, { id: identifier });
+    return data.order;
+  }
+  if (/^\d+$/.test(identifier)) {
+    const gid = `gid://shopify/Order/${identifier}`;
+    const q = `query($id: ID!) { order(id: $id) { ${selection} } }`;
+    const data = await gql(q, { id: gid });
+    return data.order;
+  }
+  const name = identifier.startsWith("#") ? identifier : `#${identifier}`;
+  const q = `
+    query($query: String) {
+      orders(first: 1, query: $query) { edges { node { ${selection} } } }
+    }
+  `;
+  const data = await gql(q, { query: `name:${name}` });
+  return data.orders.edges[0]?.node || null;
+}
+
+async function addOrderTags({ orderId, tags }) {
+  if (!orderId) throw new Error("orderId is required");
+  const tagList = normalizeTagsInput(tags);
+  if (!tagList.length) return { error: "tags is required (string, comma-separated string, or array)" };
+
+  const pre = await resolveOrderIdAndTags(orderId);
+  if (!pre) return { error: `Order not found: ${orderId}` };
+
+  const mutation = `
+    mutation($id: ID!, $tags: [String!]!) {
+      tagsAdd(id: $id, tags: $tags) {
+        node { ... on Order { id name tags } }
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await gql(mutation, { id: pre.id, tags: tagList });
+  const res = data.tagsAdd;
+  if (res.userErrors?.length) {
+    return {
+      error: res.userErrors.map((e) => e.message).join("; "),
+      userErrors: res.userErrors,
+      before: { tags: pre.tags || [] },
+    };
+  }
+  return {
+    order: { id: res.node.id, name: res.node.name },
+    addedTags: tagList,
+    before: { tags: pre.tags || [] },
+    after: { tags: res.node.tags || [] },
+  };
+}
+
+async function removeOrderTags({ orderId, tags }) {
+  if (!orderId) throw new Error("orderId is required");
+  const tagList = normalizeTagsInput(tags);
+  if (!tagList.length) return { error: "tags is required (string, comma-separated string, or array)" };
+
+  const pre = await resolveOrderIdAndTags(orderId);
+  if (!pre) return { error: `Order not found: ${orderId}` };
+
+  const mutation = `
+    mutation($id: ID!, $tags: [String!]!) {
+      tagsRemove(id: $id, tags: $tags) {
+        node { ... on Order { id name tags } }
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await gql(mutation, { id: pre.id, tags: tagList });
+  const res = data.tagsRemove;
+  if (res.userErrors?.length) {
+    return {
+      error: res.userErrors.map((e) => e.message).join("; "),
+      userErrors: res.userErrors,
+      before: { tags: pre.tags || [] },
+    };
+  }
+  return {
+    order: { id: res.node.id, name: res.node.name },
+    removedTags: tagList,
+    before: { tags: pre.tags || [] },
+    after: { tags: res.node.tags || [] },
+  };
+}
+
+async function updateOrderTags({ orderId, tags }) {
+  if (!orderId) throw new Error("orderId is required");
+  const tagList = normalizeTagsInput(tags);
+  // Empty array is valid here — it clears all tags. Don't reject it.
+
+  const pre = await resolveOrderIdAndTags(orderId);
+  if (!pre) return { error: `Order not found: ${orderId}` };
+
+  const mutation = `
+    mutation($input: OrderInput!) {
+      orderUpdate(input: $input) {
+        order { id name tags }
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await gql(mutation, { input: { id: pre.id, tags: tagList } });
+  const res = data.orderUpdate;
+  if (res.userErrors?.length) {
+    return {
+      error: res.userErrors.map((e) => e.message).join("; "),
+      userErrors: res.userErrors,
+      before: { tags: pre.tags || [] },
+    };
+  }
+  return {
+    order: { id: res.order.id, name: res.order.name },
+    replacedWith: tagList,
+    before: { tags: pre.tags || [] },
+    after: { tags: res.order.tags || [] },
+  };
+}
+
 async function getInventoryForSku({ sku }) {
   const q = `
     query($query: String) {
@@ -1135,6 +1268,78 @@ const TOOLS = [
     },
   },
   {
+    name: "add_order_tags",
+    description:
+      "Add one or more tags to an existing order without removing existing tags. REQUIRES write_orders scope. Tags are de-duplicated by Shopify (case-insensitive). Returns before/after tag arrays so the caller can verify the change.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        orderId: {
+          type: "string",
+          description:
+            "Order GID (e.g. 'gid://shopify/Order/123...'), numeric order ID, or order name (e.g. '#3114' or '3114'). Required.",
+        },
+        tags: {
+          description:
+            "Tag(s) to add. Accepts a single string, a comma-separated string, or an array of strings. Empty values are ignored.",
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+      },
+      required: ["orderId", "tags"],
+    },
+  },
+  {
+    name: "remove_order_tags",
+    description:
+      "Remove one or more tags from an existing order. Tags not present on the order are ignored. REQUIRES write_orders scope. Returns before/after tag arrays.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        orderId: {
+          type: "string",
+          description:
+            "Order GID, numeric order ID, or order name (e.g. '#3114'). Required.",
+        },
+        tags: {
+          description:
+            "Tag(s) to remove. Accepts a single string, a comma-separated string, or an array of strings.",
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+      },
+      required: ["orderId", "tags"],
+    },
+  },
+  {
+    name: "update_order_tags",
+    description:
+      "REPLACE the full set of tags on an order with the supplied list (any existing tags not in the list are removed). REQUIRES write_orders scope. Pass an empty array to clear all tags. Use `add_order_tags` / `remove_order_tags` for incremental changes — this tool is destructive of existing tags. Returns before/after tag arrays.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        orderId: {
+          type: "string",
+          description:
+            "Order GID, numeric order ID, or order name (e.g. '#3114'). Required.",
+        },
+        tags: {
+          description:
+            "Complete tag list to set on the order. Accepts a comma-separated string or an array of strings. Pass [] or '' to clear all tags.",
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+      },
+      required: ["orderId", "tags"],
+    },
+  },
+  {
     name: "get_inventory_for_sku",
     description:
       "Look up current inventory and price for a specific SKU. Returns variant-level details.",
@@ -1259,6 +1464,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "record_order_payment":
         result = await recordOrderPayment(args || {});
+        break;
+      case "add_order_tags":
+        result = await addOrderTags(args || {});
+        break;
+      case "remove_order_tags":
+        result = await removeOrderTags(args || {});
+        break;
+      case "update_order_tags":
+        result = await updateOrderTags(args || {});
         break;
       case "get_inventory_for_sku":
         result = await getInventoryForSku(args);
