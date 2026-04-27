@@ -306,7 +306,8 @@ function compactOrder(o) {
 const FULL_ORDER_SELECTION = `
   id name createdAt updatedAt currencyCode
   poNumber note tags
-  statusPageUrl
+  customerStatusPageUrl: statusPageUrl(audience: CUSTOMER)
+  merchantStatusPageUrl: statusPageUrl(audience: MERCHANT)
   displayFinancialStatus displayFulfillmentStatus
   cancelledAt cancelReason
   customer {
@@ -514,7 +515,8 @@ function fullOrderShape(o) {
     url: numericId
       ? `https://${STORE}.myshopify.com/admin/orders/${numericId}`
       : undefined,
-    statusPageUrl: o.statusPageUrl ?? null,
+    customerStatusPageUrl: o.customerStatusPageUrl ?? null,
+    merchantStatusPageUrl: o.merchantStatusPageUrl ?? null,
     customer,
     billingAddress: shapeFullAddress(o.billingAddress),
     shippingAddress: shapeFullAddress(o.shippingAddress),
