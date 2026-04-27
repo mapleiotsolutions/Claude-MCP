@@ -306,8 +306,8 @@ function compactOrder(o) {
 const FULL_ORDER_SELECTION = `
   id name createdAt updatedAt currencyCode
   poNumber note tags
-  customerStatusPageUrl: statusPageUrl(audience: CUSTOMER)
-  merchantStatusPageUrl: statusPageUrl(audience: MERCHANT)
+  customerStatusPageUrl: statusPageUrl(audience: CUSTOMERVIEW, notificationUsage: WEB)
+  merchantStatusPageUrl: statusPageUrl(audience: MERCHANTVIEW)
   displayFinancialStatus displayFulfillmentStatus
   cancelledAt cancelReason
   customer {
@@ -900,15 +900,15 @@ async function sendOrderInvoice({
   if (bcc) email.bcc = Array.isArray(bcc) ? bcc : [bcc];
 
   const mutation = `
-    mutation($orderId: ID!, $email: EmailInput) {
-      orderInvoiceSend(orderId: $orderId, email: $email) {
+    mutation($id: ID!, $email: EmailInput) {
+      orderInvoiceSend(id: $id, email: $email) {
         order { id name }
         userErrors { field message }
       }
     }
   `;
   const data = await gql(mutation, {
-    orderId: pre.id,
+    id: pre.id,
     email: Object.keys(email).length ? email : null,
   });
   const res = data.orderInvoiceSend;
