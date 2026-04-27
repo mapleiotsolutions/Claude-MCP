@@ -301,6 +301,310 @@ function compactOrder(o) {
   };
 }
 
+// Full order selection — used by get_order and search_orders_full.
+// Uses non-deprecated fields: defaultEmailAddress, defaultPhoneNumber, countryCodeV2.
+const FULL_ORDER_SELECTION = `
+  id name createdAt updatedAt currencyCode
+  poNumber note tags
+  displayFinancialStatus displayFulfillmentStatus
+  cancelledAt cancelReason
+  customer {
+    id firstName lastName
+    defaultEmailAddress { emailAddress }
+    defaultPhoneNumber { phoneNumber }
+  }
+  billingAddress {
+    firstName lastName company address1 address2
+    city province provinceCode zip country countryCodeV2 phone
+  }
+  shippingAddress {
+    firstName lastName company address1 address2
+    city province provinceCode zip country countryCodeV2 phone
+  }
+  lineItems(first: 100) {
+    edges {
+      node {
+        id title variantTitle sku vendor quantity
+        taxable requiresShipping
+        originalUnitPriceSet { shopMoney { amount currencyCode } }
+        discountedUnitPriceSet { shopMoney { amount currencyCode } }
+        originalTotalSet { shopMoney { amount currencyCode } }
+        discountedTotalSet { shopMoney { amount currencyCode } }
+        discountAllocations {
+          allocatedAmountSet { shopMoney { amount currencyCode } }
+          discountApplication { index }
+        }
+      }
+    }
+  }
+  discountApplications(first: 20) {
+    edges {
+      node {
+        index targetType targetSelection allocationMethod
+        value {
+          ... on MoneyV2 { amount currencyCode }
+          ... on PricingPercentageValue { percentage }
+        }
+        ... on DiscountCodeApplication { code }
+        ... on ManualDiscountApplication { title description }
+        ... on AutomaticDiscountApplication { title }
+      }
+    }
+  }
+  subtotalPriceSet { shopMoney { amount currencyCode } }
+  totalTaxSet { shopMoney { amount currencyCode } }
+  totalShippingPriceSet { shopMoney { amount currencyCode } }
+  totalPriceSet { shopMoney { amount currencyCode } }
+  netPaymentSet { shopMoney { amount currencyCode } }
+  totalRefundedSet { shopMoney { amount currencyCode } }
+  totalOutstandingSet { shopMoney { amount currencyCode } }
+  shippingLines(first: 10) {
+    edges {
+      node {
+        id title
+        originalPriceSet { shopMoney { amount currencyCode } }
+        discountedPriceSet { shopMoney { amount currencyCode } }
+        discountAllocations {
+          allocatedAmountSet { shopMoney { amount currencyCode } }
+          discountApplication { index }
+        }
+      }
+    }
+  }
+  taxLines {
+    title rate
+    priceSet { shopMoney { amount currencyCode } }
+  }
+  transactions(first: 50) {
+    id gateway kind status createdAt
+    amountSet { shopMoney { amount currencyCode } }
+  }
+  fulfillments(first: 25) {
+    status createdAt
+    trackingInfo { company number url }
+  }
+`;
+
+function shapeFullAddress(a) {
+  if (!a) return null;
+  return {
+    firstName: a.firstName ?? null,
+    lastName: a.lastName ?? null,
+    company: a.company ?? null,
+    address1: a.address1 ?? null,
+    address2: a.address2 ?? null,
+    city: a.city ?? null,
+    province: a.province ?? null,
+    provinceCode: a.provinceCode ?? null,
+    zip: a.zip ?? null,
+    country: a.country ?? null,
+    countryCode: a.countryCodeV2 ?? null,
+    phone: a.phone ?? null,
+  };
+}
+
+function fullOrderShape(o) {
+  if (!o) return null;
+  const numericId = o.id?.replace("gid://shopify/Order/", "");
+
+  const discountApps = (o.discountApplications?.edges || []).map((e) => {
+    const da = e.node;
+    return {
+      _index: da.index,
+      title: da.code || da.title || "Discount",
+      targetType: da.targetType,
+      targetSelection: da.targetSelection,
+      allocationMethod: da.allocationMethod,
+      value: da.value
+        ? da.value.percentage != null
+          ? { percentage: da.value.percentage }
+          : { amount: da.value.amount, currency: da.value.currencyCode }
+        : null,
+      _runningTotal: 0,
+    };
+  });
+
+  // Index discount apps by their `index` field for O(1) lookup.
+  const appByIndex = new Map(discountApps.map((d) => [d._index, d]));
+
+  function trackAllocation(allocation) {
+    const idx = allocation?.discountApplication?.index;
+    if (idx == null) return null;
+    const app = appByIndex.get(idx);
+    if (!app) return null;
+    const amt = parseFloat(allocation.allocatedAmountSet?.shopMoney?.amount || "0");
+    if (!Number.isNaN(amt)) app._runningTotal += amt;
+    return app;
+  }
+
+  const lineItems = (o.lineItems?.edges || []).map((e) => {
+    const li = e.node;
+    const allocations = (li.discountAllocations || []).map((a) => {
+      const app = trackAllocation(a);
+      return {
+        title: app?.title || "Discount",
+        amount: a.allocatedAmountSet?.shopMoney?.amount,
+      };
+    });
+    return {
+      id: li.id,
+      title: li.title,
+      variantTitle: li.variantTitle ?? null,
+      sku: li.sku ?? null,
+      vendor: li.vendor ?? null,
+      quantity: li.quantity,
+      taxable: li.taxable,
+      requiresShipping: li.requiresShipping,
+      originalUnitPrice: li.originalUnitPriceSet?.shopMoney?.amount,
+      discountedUnitPrice: li.discountedUnitPriceSet?.shopMoney?.amount,
+      originalTotal: li.originalTotalSet?.shopMoney?.amount,
+      discountedTotal: li.discountedTotalSet?.shopMoney?.amount,
+      lineLevelDiscountAllocations: allocations,
+    };
+  });
+
+  let shippingDiscounted = false;
+  const shippingLines = (o.shippingLines?.edges || []).map((e) => {
+    const sl = e.node;
+    const orig = parseFloat(sl.originalPriceSet?.shopMoney?.amount || "0");
+    const disc = parseFloat(sl.discountedPriceSet?.shopMoney?.amount || "0");
+    if (orig > 0 && disc === 0) shippingDiscounted = true;
+    (sl.discountAllocations || []).forEach(trackAllocation);
+    return {
+      id: sl.id,
+      title: sl.title,
+      originalPrice: sl.originalPriceSet?.shopMoney?.amount,
+      discountedPrice: sl.discountedPriceSet?.shopMoney?.amount,
+    };
+  });
+
+  const finalDiscountApps = discountApps.map((d) => ({
+    title: d.title,
+    targetType: d.targetType,
+    targetSelection: d.targetSelection,
+    allocationMethod: d.allocationMethod,
+    value: d.value,
+    totalAllocatedAmount: d._runningTotal.toFixed(2),
+  }));
+
+  const customer = o.customer
+    ? {
+        id: o.customer.id,
+        firstName: o.customer.firstName ?? null,
+        lastName: o.customer.lastName ?? null,
+        email: o.customer.defaultEmailAddress?.emailAddress ?? null,
+        phone: o.customer.defaultPhoneNumber?.phoneNumber ?? null,
+      }
+    : null;
+
+  return {
+    id: o.id,
+    name: o.name,
+    createdAt: o.createdAt,
+    updatedAt: o.updatedAt,
+    currency: o.currencyCode,
+    poNumber: o.poNumber ?? null,
+    note: o.note ?? null,
+    tags: o.tags || [],
+    financialStatus: o.displayFinancialStatus,
+    fulfillmentStatus: o.displayFulfillmentStatus,
+    cancelledAt: o.cancelledAt ?? null,
+    cancelReason: o.cancelReason ?? null,
+    url: numericId
+      ? `https://${STORE}.myshopify.com/admin/orders/${numericId}`
+      : undefined,
+    customer,
+    billingAddress: shapeFullAddress(o.billingAddress),
+    shippingAddress: shapeFullAddress(o.shippingAddress),
+    lineItems,
+    discountApplications: finalDiscountApps,
+    subtotalPrice: o.subtotalPriceSet?.shopMoney?.amount,
+    totalTax: o.totalTaxSet?.shopMoney?.amount,
+    totalShipping: o.totalShippingPriceSet?.shopMoney?.amount,
+    totalPrice: o.totalPriceSet?.shopMoney?.amount,
+    netPayment: o.netPaymentSet?.shopMoney?.amount,
+    totalRefunded: o.totalRefundedSet?.shopMoney?.amount,
+    outstandingAmount: o.totalOutstandingSet?.shopMoney?.amount,
+    shippingLines,
+    shippingDiscounted,
+    taxLines: (o.taxLines || []).map((t) => ({
+      title: t.title,
+      rate: t.rate,
+      price: t.priceSet?.shopMoney?.amount,
+    })),
+    transactions: (o.transactions || []).map((t) => ({
+      id: t.id,
+      gateway: t.gateway,
+      kind: t.kind,
+      status: t.status,
+      amount: t.amountSet?.shopMoney?.amount,
+      createdAt: t.createdAt,
+    })),
+    fulfillments: (o.fulfillments || []).map((f) => {
+      const ti = (f.trackingInfo || [])[0] || {};
+      return {
+        status: f.status,
+        trackingCompany: ti.company ?? null,
+        trackingNumber: ti.number ?? null,
+        trackingUrl: ti.url ?? null,
+        createdAt: f.createdAt,
+      };
+    }),
+  };
+}
+
+async function getOrder({ identifier }) {
+  if (!identifier) throw new Error("identifier is required");
+
+  // GID — direct lookup.
+  if (identifier.startsWith("gid://")) {
+    const q = `query($id: ID!) { order(id: $id) { ${FULL_ORDER_SELECTION} } }`;
+    const data = await gql(q, { id: identifier });
+    return fullOrderShape(data.order);
+  }
+  // Numeric ID — convert to GID.
+  if (/^\d+$/.test(identifier)) {
+    const gid = `gid://shopify/Order/${identifier}`;
+    const q = `query($id: ID!) { order(id: $id) { ${FULL_ORDER_SELECTION} } }`;
+    const data = await gql(q, { id: gid });
+    return fullOrderShape(data.order);
+  }
+  // Order name — normalize leading '#' and search.
+  const name = identifier.startsWith("#") ? identifier : `#${identifier}`;
+  const q = `
+    query($query: String) {
+      orders(first: 1, query: $query) {
+        edges { node { ${FULL_ORDER_SELECTION} } }
+      }
+    }
+  `;
+  const data = await gql(q, { query: `name:${name}` });
+  return fullOrderShape(data.orders.edges[0]?.node);
+}
+
+async function searchOrdersFull({ query = "", limit = 50, cursor } = {}) {
+  const q = `
+    query($query: String, $first: Int!, $after: String) {
+      orders(first: $first, query: $query, after: $after, sortKey: CREATED_AT, reverse: true) {
+        edges { node { ${FULL_ORDER_SELECTION} } }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  `;
+  const data = await gql(q, {
+    query,
+    first: Math.min(limit, 250),
+    after: cursor || null,
+  });
+  return {
+    orders: data.orders.edges.map((e) => fullOrderShape(e.node)),
+    pageInfo: {
+      hasNextPage: data.orders.pageInfo.hasNextPage,
+      endCursor: data.orders.pageInfo.endCursor,
+    },
+  };
+}
+
 async function searchOrders({ query = "", limit = 25 }) {
   const q = `
     query($query: String, $first: Int!) {
@@ -754,6 +1058,46 @@ const TOOLS = [
     },
   },
   {
+    name: "get_order",
+    description:
+      "Get full detail for a single order — line items (with per-line discount allocations), billing/shipping addresses, money totals, tax lines, transactions, and fulfillments. Use this for invoice generation or mailing labels. Identifier accepts an order GID ('gid://shopify/Order/...'), numeric order ID, or order name (with or without leading '#', e.g. '#3528' or '3528'). Returns null when the order isn't found. REQUIRES read_orders, read_customers, and read_assigned_fulfillment_orders scopes.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        identifier: {
+          type: "string",
+          description:
+            "Order GID, numeric order ID, or order name (e.g. '#3528' or '3528').",
+        },
+      },
+      required: ["identifier"],
+    },
+  },
+  {
+    name: "search_orders_full",
+    description:
+      "Same query syntax as `search_orders`, but returns full per-order detail (line items, addresses, transactions, etc.) and supports cursor pagination — use this when you need to pull invoice-grade data for many orders in one pass. Heavy: prefer `search_orders` for summary-only scans. Returns { orders, pageInfo: { hasNextPage, endCursor } }. Pass the returned `endCursor` back as `cursor` to fetch the next page.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        query: {
+          type: "string",
+          description:
+            "Shopify order search query (same syntax as `search_orders`). Empty string returns all orders, newest first.",
+        },
+        limit: {
+          type: "number",
+          description: "Max results per page (default 50, cap 250).",
+        },
+        cursor: {
+          type: "string",
+          description:
+            "Optional pagination cursor. Pass the `endCursor` returned by the previous call to fetch the next page. Omit for the first page.",
+        },
+      },
+    },
+  },
+  {
     name: "get_unpaid_orders",
     description:
       "List unpaid orders (financial status: pending, authorized, or partially_paid). Sorted newest first.",
@@ -903,6 +1247,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "search_orders":
         result = await searchOrders(args || {});
+        break;
+      case "get_order":
+        result = await getOrder(args || {});
+        break;
+      case "search_orders_full":
+        result = await searchOrdersFull(args || {});
         break;
       case "get_unpaid_orders":
         result = await getUnpaidOrders(args || {});
