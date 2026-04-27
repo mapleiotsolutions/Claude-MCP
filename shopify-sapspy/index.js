@@ -306,6 +306,7 @@ function compactOrder(o) {
 const FULL_ORDER_SELECTION = `
   id name createdAt updatedAt currencyCode
   poNumber note tags
+  statusPageUrl
   displayFinancialStatus displayFulfillmentStatus
   cancelledAt cancelReason
   customer {
@@ -513,6 +514,7 @@ function fullOrderShape(o) {
     url: numericId
       ? `https://${STORE}.myshopify.com/admin/orders/${numericId}`
       : undefined,
+    statusPageUrl: o.statusPageUrl ?? null,
     customer,
     billingAddress: shapeFullAddress(o.billingAddress),
     shippingAddress: shapeFullAddress(o.shippingAddress),
@@ -872,6 +874,52 @@ async function updateOrderTags({ orderId, tags }) {
     replacedWith: tagList,
     before: { tags: pre.tags || [] },
     after: { tags: res.order.tags || [] },
+  };
+}
+
+async function sendOrderInvoice({
+  orderId,
+  to,
+  from,
+  bcc,
+  subject,
+  customMessage,
+}) {
+  if (!orderId) throw new Error("orderId is required");
+
+  const pre = await resolveOrderIdAndTags(orderId);
+  if (!pre) return { error: `Order not found: ${orderId}` };
+
+  const email = {};
+  if (to) email.to = to;
+  if (from) email.from = from;
+  if (subject) email.subject = subject;
+  if (customMessage) email.customMessage = customMessage;
+  if (bcc) email.bcc = Array.isArray(bcc) ? bcc : [bcc];
+
+  const mutation = `
+    mutation($orderId: ID!, $email: EmailInput) {
+      orderInvoiceSend(orderId: $orderId, email: $email) {
+        order { id name }
+        userErrors { field message }
+      }
+    }
+  `;
+  const data = await gql(mutation, {
+    orderId: pre.id,
+    email: Object.keys(email).length ? email : null,
+  });
+  const res = data.orderInvoiceSend;
+  if (res.userErrors?.length) {
+    return {
+      error: res.userErrors.map((e) => e.message).join("; "),
+      userErrors: res.userErrors,
+    };
+  }
+  return {
+    order: { id: res.order.id, name: res.order.name },
+    sent: true,
+    overrides: Object.keys(email).length ? email : null,
   };
 }
 
@@ -1340,6 +1388,49 @@ const TOOLS = [
     },
   },
   {
+    name: "send_order_invoice",
+    description:
+      "Send the Shopify-generated invoice email for an order to the customer. Wraps the orderInvoiceSend GraphQL mutation. The email contains the customer-facing payment/status link (same as `statusPageUrl`). REQUIRES write_orders scope. By default Shopify sends to the order's customer email using the store's default invoice template — pass overrides only if you want to retarget or customize the message.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        orderId: {
+          type: "string",
+          description:
+            "Order GID, numeric order ID, or order name (e.g. '#3114'). Required.",
+        },
+        to: {
+          type: "string",
+          description:
+            "Optional. Override recipient email. Defaults to the order's customer email.",
+        },
+        from: {
+          type: "string",
+          description:
+            "Optional. Override sender email. Defaults to the store's sender address.",
+        },
+        bcc: {
+          description:
+            "Optional. Email address(es) to BCC. String or array of strings.",
+          oneOf: [
+            { type: "string" },
+            { type: "array", items: { type: "string" } },
+          ],
+        },
+        subject: {
+          type: "string",
+          description: "Optional. Override the email subject line.",
+        },
+        customMessage: {
+          type: "string",
+          description:
+            "Optional. Custom message body inserted into the invoice email.",
+        },
+      },
+      required: ["orderId"],
+    },
+  },
+  {
     name: "get_inventory_for_sku",
     description:
       "Look up current inventory and price for a specific SKU. Returns variant-level details.",
@@ -1473,6 +1564,9 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         break;
       case "update_order_tags":
         result = await updateOrderTags(args || {});
+        break;
+      case "send_order_invoice":
+        result = await sendOrderInvoice(args || {});
         break;
       case "get_inventory_for_sku":
         result = await getInventoryForSku(args);
